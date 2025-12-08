@@ -19,69 +19,50 @@ from langchain.prompts import PromptTemplate
 DATA_DIR = "data2/"
 FAISS_INDEX_PATH = "faiss_index"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
-os.environ["GOOGLE_API_KEY"] = "AIzaSyBhadhUvpKhISbb4-91_IqdVm10dXZTjXo"
+os.environ["GOOGLE_API_KEY"] = "AIzaSyCqnz7-HFT06k6rmIgBVRRxV2-GzwQaR9I"
 
 app = Flask(__name__)
 CORS(app)
 
 # ===========================
-# Functions for VectorStore
+# TEXT CLEANING FUNCTIONS
 # ===========================
 def clean_text(text):
-    # chuẩn hóa unicode
     text = unicodedata.normalize("NFC", text)
-
-    # thay thế bullet
     text = text.replace("•", "- ").replace("▪", "- ").replace("·", "- ").replace("●", "- ").replace("✓", "- ")
-
-    # xóa khoảng trắng thừa
     text = re.sub(r"\s+\n", "\n", text)
     text = re.sub(r"\n{2,}", "\n\n", text)
     return text
 
 def clean_markdown(text):
-    """
-    Chuẩn hóa Markdown trong phản hồi:
-    - Thay * **text** → - **text**
-    - Thay * text → - text
-    - Loại bỏ * thừa
-    - Đảm bảo bullet dùng dấu gạch đầu dòng '-'
-    """
     lines = text.split("\n")
     cleaned_lines = []
     
     for line in lines:
         line = line.strip()
-        
-        # Bỏ dòng trống
         if not line:
             cleaned_lines.append("")
             continue
             
-        # Sửa: * **text** → - **text**
         line = re.sub(r"^\*\s*\*\*(.+?)\*\*", r"- **\1**", line)
-        
-        # Sửa: * text → - text
         line = re.sub(r"^\*\s+", "- ", line)
-        
-        # Sửa: **text** (không có bullet) → - **text**
+
         if line.startswith("**") and not line.startswith("- **"):
             line = "- " + line
         
         cleaned_lines.append(line)
     
     result = "\n".join(cleaned_lines)
-    
-    # Loại bỏ khoảng trắng thừa giữa các dòng
     result = re.sub(r"\n{3,}", "\n\n", result)
-    
     return result.strip()
 
 def ensure_directory(path):
     os.makedirs(path, exist_ok=True)
-    print(f"Đã đảm bảo thư mục tồn tại: {path}")
+    print(f"Ensured directory exists: {path}")
 
-
+# ===========================
+# VECTORSTORE INIT
+# ===========================
 def create_or_load_vectorstore():
     ensure_directory(FAISS_INDEX_PATH)
 
@@ -89,52 +70,57 @@ def create_or_load_vectorstore():
     pkl_file = os.path.join(FAISS_INDEX_PATH, "index.pkl")
 
     if os.path.exists(index_file) and os.path.exists(pkl_file):
-        print("Đang tải lại vector store...")
+        print("Loading vector store...")
         vectorstore = FAISS.load_local(
             FAISS_INDEX_PATH,
             HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL),
             allow_dangerous_deserialization=True
         )
-        print("Tải thành công.")
+        print("Vector store loaded.")
     else:
-        print("Không tìm thấy vector store. Đang tạo mới...")
+        print("Building new vector store...")
 
         loader = DirectoryLoader(DATA_DIR, glob="*.pdf", loader_cls=PyPDFLoader)
         documents = loader.load()
         for doc in documents:
             doc.page_content = clean_text(doc.page_content)
-        if len(documents) == 0:
-            raise ValueError("Không tìm thấy file PDF nào trong DATA_DIR.")
 
-        print(f"Đã nạp {len(documents)} tài liệu PDF")
+        if len(documents) == 0:
+            raise ValueError("No PDF files found in DATA_DIR.")
+
+        print(f"Loaded {len(documents)} PDF files")
 
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=350,
-            chunk_overlap=30,
+            chunk_size=520,
+            chunk_overlap=60,
             separators=["\n\n", "\n", "✓", "-", "•", ".", " "]
         )
         docs = text_splitter.split_documents(documents)
 
-        print(f"Đã chia thành {len(docs)} đoạn văn nhỏ")
+        print(f"Split into {len(docs)} chunks")
 
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
         vectorstore = FAISS.from_documents(docs, embeddings)
 
         vectorstore.save_local(FAISS_INDEX_PATH)
-        print("Đã lưu vector store!")
+        print("Vector store saved.")
 
     return vectorstore
 
 
+# ===========================
+# ENGLISH SYSTEM PROMPT
+# ===========================
 system_prompt = """
-Bạn là chuyên gia tuyển dụng (HR Expert).
-Nhiệm vụ: trả lời câu hỏi chỉ dựa trên nội dung của CV được cung cấp.
-Nếu thông tin không có trong CV, hãy nói: "Thông tin này không xuất hiện trong CV."
+You are a professional HR Expert.
+Your task is to answer questions ONLY based on the content of the provided CV.
+If the information does not exist in the CV, respond: "This information does not appear in the CV."
 
-Yêu cầu:
-- Trả lời ngắn gọn, rõ ràng.
-- Dùng bullet nếu cần.
-- Ưu tiên phân tích kỹ năng, kinh nghiệm, level, phù hợp JD...
+Requirements:
+- Always answer in **English only**.
+- Keep responses short and clear.
+- Use bullet points when appropriate.
+- Focus on analyzing skills, experience, seniority level, relevance to job description, etc.
 """
 
 qa_prompt = PromptTemplate(
@@ -145,23 +131,27 @@ qa_prompt = PromptTemplate(
 {context}
 ====================
 
-Câu hỏi: {question}
+Question: {question}
 """
 )
-
 
 # ===========================
 # INIT MODEL & RETRIEVER
 # ===========================
-print("🔧 Khởi tạo embeddings + FAISS...")
+print("🔧 Initializing FAISS...")
 vectorstore = create_or_load_vectorstore()
+
 retriever = vectorstore.as_retriever(
     search_type="mmr",
-    search_kwargs={"k": 6, "lambda_mult": 0.5}
+    search_kwargs={"k": 2, "lambda_mult": 0.5}
 )
 
-print("🔧 Khởi tạo LLM...")
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1, max_output_tokens=1024)
+print("🔧 Initializing Gemini model...")
+model = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0.3,
+    max_output_tokens=1024
+)
 
 qa_chain = RetrievalQA.from_chain_type(
     llm=model,
@@ -171,7 +161,7 @@ qa_chain = RetrievalQA.from_chain_type(
     chain_type_kwargs={"prompt": qa_prompt}
 )
 
-print("🔥 RAG chatbot sẵn sàng!")
+print("🔥 RAG chatbot is ready!")
 
 
 # ===========================
@@ -188,27 +178,20 @@ def ask():
     result = qa_chain.invoke({"query": question})
 
     raw_answer = result["result"]
-    answer = clean_markdown(raw_answer)  # ÁP DỤNG CHUẨN HÓA
+    answer = clean_markdown(raw_answer)
 
     sources = []
     for doc in result["source_documents"]:
         src = os.path.basename(doc.metadata["source"])
         page = doc.metadata.get("page", "N/A")
-        sources.append({
-            "file": src,
-            "page": page
-        })
+        sources.append({"file": src, "page": page})
 
-    return jsonify({
-        "answer": answer,
-        "sources": sources
-    }), 200
+    return jsonify({"answer": answer, "sources": sources}), 200
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "RAG Chatbot Flask Backend is running!", 200
-
+    return "RAG Chatbot Backend is running (English-only mode).", 200
 
 
 if __name__ == "__main__":
